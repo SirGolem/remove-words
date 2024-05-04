@@ -1,0 +1,94 @@
+name: Build-and-Release
+
+on:
+    workflow_run:
+        branches: main
+        workflows: 'Format-Lint-and-Test'
+        types: completed
+
+env:
+    CARGO_TERM_COLOR: always
+
+permissions:
+    contents: write
+
+jobs:
+    create-release-draft:
+        name: Create Release Draft
+        if: github.event.workflow_run.conclusion == 'success'
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - name: Create release draft
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  name=$(grep -m 1 -E 'name\s*=\s*".*?"' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+                  version=$(grep -m 1 -E 'version\s*=\s*".*?"' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+                  gh release create "v${version}" --generate-notes --draft
+    build:
+        name: Build and Release
+        needs: create-release-draft
+        if:
+        runs-on: ${{ matrix.runner }}
+
+        strategy:
+            matrix:
+                include:
+                    - name: win-x86_64
+                      runner: windows-latest
+                      target: x86_64-pc-windows-msvc
+                      extension: .exe
+                    - name: linux-x86_64
+                      runner: ubuntu-latest
+                      target: x86_64-unknown-linux-gnu
+                    - name: macos-x86_64
+                      runner: macos-latest
+                      target: x86_64-apple-darwin
+                    - name: macos-aarch64
+                      runner: macos-latest
+                      target: aarch64-apple-darwin
+
+        steps:
+            - uses: actions/checkout@v4
+            - name: Add target
+              run: rustup target add ${{ matrix.target }}
+            - name: Build
+              run: cargo build --release --verbose --target ${{ matrix.target }}
+            - name: Add to release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              shell: bash
+              run: |
+                  name=$(grep -m 1 -E 'name\s*=\s*".*?"' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+                  version=$(grep -m 1 -E 'version\s*=\s*".*?"' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+                  mv "target/${{ matrix.target }}/release/${name}${{ matrix.extension }}" "target/${{ matrix.target }}/release/${name}-${{ matrix.target }}${{ matrix.extension }}"
+                  gh release upload "v${version}" "target/${{ matrix.target }}/release/${name}-${{ matrix.target }}${{ matrix.extension }}"
+    publish-release:
+        name: Publish Release
+        needs: build
+        if: success()
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v4
+            - name: Publish release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  version=$(grep -m 1 -E 'version\s*=\s*".*?"' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+                  gh release edit "v${version}" --draft=false
+    delete-failed-release:
+        name: Delete Failed Release
+        needs: [create-release-draft, build, publish-release]
+        if: (cancelled() && needs.create-release-draft.result == 'success') || needs.build.result == 'failure' || needs.publish-release.result == 'failure'
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v4
+            - name: Delete release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  version=$(grep -m 1 -E 'version\s*=\s*".*?"' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+                  gh release delete "v${version}"
